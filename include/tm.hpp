@@ -26,6 +26,13 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <vector>
+#include <atomic>
+#include <mutex>
+
+#define REGION_BYTE_SIZE 1073741824 // 1GiO
+
+using namespace std;
 
 // -------------------------------------------------------------------------- //
 
