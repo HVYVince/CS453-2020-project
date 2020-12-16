@@ -85,6 +85,7 @@ public:
     ::std::variant<Chrono, char const*> master_wait(Chrono::Tick maxtick = Chrono::invalid_tick) {
         // Wait for all worker threads, synchronize-with the last one
         if (!donelatch.wait(maxtick))
+            // ::std::cout << "Transactional library takes too long to process the transactions" << ::std::endl;
             throw Exception::BoundedOverrun{"Transactional library takes too long to process the transactions"};
         // Return runtime on success, of error message on failure
         switch (status.load(::std::memory_order_relaxed)) {
@@ -93,6 +94,7 @@ public:
         case Status::Fail:
             return errmsg;
         default:
+            // ::std::cout << "Master woke after raised latch, no timeout, but unexpected status" << ::std::endl;
             throw Exception::Unreachable{"Master woke after raised latch, no timeout, but unexpected status"};
         }
     }

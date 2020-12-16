@@ -29,8 +29,14 @@
 #include <vector>
 #include <atomic>
 #include <mutex>
+#include <condition_variable>
+#include <cstring>
+#include <iostream>
 
 #define REGION_BYTE_SIZE 1073741824 // 1GiO
+#define READ_ONLY_OFFSET 4294967296 // 2^32
+#define READ 0
+#define WRITE 1
 
 using namespace std;
 
