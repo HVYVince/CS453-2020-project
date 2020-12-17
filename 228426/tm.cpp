@@ -155,8 +155,8 @@ shared_t tm_create(size_t size, size_t align) noexcept {
     cout << "DATA END AT " << datas + (sizeof(Segment*) + sizeof(void*) + sizeof(bool) + region->delta_alloc + size) * MAX_TRANSACTIONS << endl;
 
     region->reference_memory = &datas;
-    region->transact_memories = (Segment**)((char*)datas + (sizeof(Segment*) * MAX_TRANSACTIONS));
-    region->readonly_transactions = (bool*)((char*)datas + (sizeof(void*) + sizeof(Segment*) * MAX_TRANSACTIONS));
+    region->transact_memories = (Segment**)((char*)datas + (sizeof(intptr_t) * MAX_TRANSACTIONS));
+    region->readonly_transactions = (bool*)((char*)datas + (sizeof(intptr_t) + sizeof(Segment*) * MAX_TRANSACTIONS));
 
     for(size_t i = 0 ; i < MAX_TRANSACTIONS ; i++) {
         region->transact_memories[i] = (Segment*)((char*)(&region->readonly_transactions[MAX_TRANSACTIONS]) + i * (region->delta_alloc + size));
