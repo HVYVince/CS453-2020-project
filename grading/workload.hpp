@@ -358,6 +358,7 @@ public:
             if (unlikely(!correct))
                 return "Violated consistency";
         }
+
         return nullptr;
     }
 };

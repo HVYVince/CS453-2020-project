@@ -92,9 +92,13 @@ struct Region {
     vector<Segment*> new_segments;
     // mutex vector_mutex;
     mutex batcher_mutex;
+    mutex commit_mutex;
     atomic_uint in_transaction;
-    atomic_ulong waiting;
+    atomic_uint tx_generator;
+    atomic_uint waiting;
+    atomic_uint expected_out;
     condition_variable batcher;
+    condition_variable commit_holder;
     // size_t initial_size;
     void* start_address;
 
@@ -105,7 +109,9 @@ struct Region {
         segments = vector<Segment*>();//(1, nullptr);
         new_segments = vector<Segment*>();
         in_transaction.store(0);
-        // waiting.store(0);
+        tx_generator.store(0);
+        waiting.store(0);
+        expected_out.store(1);
         // initial_size = size;
     }
 };
@@ -134,8 +140,8 @@ shared_t tm_create(size_t size, size_t align) noexcept {
     //     return invalid_shared;
     // }
 
-    region->start_address = region->segments[0]->start;
     region->segments[0]->start = region->memory[READ];
+    region->start_address = region->segments[0]->start;
     region->align_alloc = align_alloc;
 
     if(unlikely(!region->segments[0]))
@@ -158,9 +164,9 @@ void tm_destroy(shared_t shared) noexcept {
         delete[] segment->accessed_id;
         delete segment;
     }
-    region->segments.clear();
-    region->new_segments.clear();
-    free(region->memory);
+    // region->segments.clear();
+    // region->new_segments.clear();
+    // free(region->memory);
     delete region;
 }
 
@@ -171,6 +177,7 @@ void tm_destroy(shared_t shared) noexcept {
 void* tm_start(shared_t shared) noexcept {
     cout << "TM START " << endl;
     Region* region = (Region*) shared;
+    cout << region->start_address << endl;
     return region->start_address;
 }
 
@@ -202,27 +209,35 @@ size_t tm_align(shared_t shared) noexcept {
 tx_t tm_begin(shared_t shared , bool is_ro) noexcept {
     cout << "TM BEGIN " << endl;
     Region* region = (Region*) shared;
-    tx_t id = ++(region->waiting);
+    tx_t id = ++(region->tx_generator);
     // cout << "ID UPDATED " << endl;
     if(is_ro)
         id += READ_ONLY_OFFSET;
     // cout << "LOCKING " << endl;
     unique_lock<mutex> lock(region->batcher_mutex);
+    region->waiting++;
     // cout << "LOCKED " << endl;
     if(region->in_transaction.load() != 0)
         region->batcher.wait(lock);
     // cout << "PASSED THROUGH " << endl;
+    region->expected_out--;
+    region->waiting--;
     region->in_transaction++;
     lock.unlock();
 
-    // cout << "IN TRANSACTION " << endl;
-    // cout << id << endl;
+    cout << "IN TRANSACTION " << endl;
+    cout << id << endl;
     return id;
 }
 
 void end_transaction(Region* region) {
     cout << "ENDING TRANSACT " << endl;
+    // unique_lock<mutex> lock(region->batcher_mutex);  
+    cout << "OUT " << region->expected_out.load() << endl;
+    while(region->expected_out.load() != 0 && region->expected_out.load() < 100);  
     int left = --(region->in_transaction);
+    // lock.unlock();
+    cout << "LEFT " << left << endl;
     if(left == 0) {
         cout << "END OF BATCH " << endl;
         for(size_t j = 0 ; j < region->segments.size() ; j++) {
@@ -238,29 +253,44 @@ void end_transaction(Region* region) {
                 continue;
             }
 
+            // cout << seg->size << endl;
+
             for(size_t i = 0 ; i < seg->size ; i++) {
                 void* current = seg->start + i;
-                if(seg->accessed[i]) {
-                    seg->accessed_id[i].store(0);
-                    seg->accessed[i].store(false);
-                    memcpy(current, current + WRITE_OFFSET, 1);
-                }
+                // cout << current << endl;
+                seg->accessed_id[i].store(0);
+                seg->accessed[i].store(false);
+                memcpy(current, current + WRITE_OFFSET, seg->size);
+                // if(seg->accessed[i].load()) {
+                //     // cout << current + WRITE_OFFSET << endl;
+                //     seg->accessed[i].store(false);
+                //     memcpy(current, current + WRITE_OFFSET, 1);
+                // }
             }
         }
 
-        for(auto new_seg : region->new_segments) {
-            for(size_t i = 1 ; i < region->segments.size() ; i++) {
-                if(new_seg->start < region->segments[i]->start) {
-                    auto iterator = region->segments.begin() + i;
-                    region->segments.insert(iterator, new_seg);
-                    break;
-                }
-            }
-        }
+        // for(auto new_seg : region->new_segments) {
+        //     for(size_t i = 1 ; i < region->segments.size() ; i++) {
+        //         if(new_seg->start < region->segments[i]->start) {
+        //             auto iterator = region->segments.begin() + i;
+        //             region->segments.insert(iterator, new_seg);
+        //             break;
+        //         }
+        //     }
+        // }
 
-        region->new_segments.clear();
+        // region->new_segments.clear();
+        region->expected_out.exchange(region->waiting);
+        cout << "OUT BEFORE " << region->expected_out.load() << endl;
+        region->waiting.store(0);
+        region->commit_holder.notify_all();
         region->batcher.notify_all();
+        return;
     }
+    cout << "TRANSACT ENDED " << endl;
+    unique_lock<mutex> output_lock(region->commit_mutex);
+    region->commit_holder.wait(output_lock);
+    output_lock.unlock();
 }
 
 /** [thread-safe] End the given transaction.
@@ -291,6 +321,9 @@ Segment* check_segments(vector<Segment*> &segments, const void* source_address, 
     cout << "SEG CHECK DEFAULT " << endl;
     return nullptr;
 }
+        // cout << seg->size << endl;
+        // cout << source << endl;
+        // cout << siz
 
 /** [thread-safe] Read operation in the given transaction, source in the shared region and target in a private region.
  * @param shared Shared memory region associated with the transaction
@@ -300,54 +333,90 @@ Segment* check_segments(vector<Segment*> &segments, const void* source_address, 
  * @param target Target start address (in a private region)
  * @return Whether the whole transaction can continue
 **/
-bool tm_read(shared_t shared, tx_t tx, void const* source, size_t size, void* target ) noexcept {
+bool tm_read(shared_t shared, tx_t tx, void const* source, size_t size, void* target) noexcept {
     cout << "TM READ " << endl;
     Region* region = (Region*) shared;
     // unsigned long source_address = *((unsigned long*) source);
     Segment* seg = check_segments(region->segments, source, size);
     if(seg == nullptr) {// && !check_segments(region->new_segments, source_address, size)) {
+        cout << "SEG CHECK READ FAIL " << endl;
         end_transaction(region); //SHOULD WE CHECK IN NEW SEGS ?
         return false;
     }
 
     if(tx > READ_ONLY_OFFSET) {
         cout << "READ SUCCESSFUL READONLY " << endl;
+        // cout << seg->start << endl;
+        // cout << seg->size << endl;
+        // cout << source << endl;
+        // cout << size << endl;
+        cout << source << endl;
         memcpy(target, source, size);
         return true;
     }
-    
-    bool already_accessed = false;
-    unsigned long offset = (char*)source - (char*)seg->start;
-    for(size_t i = offset ; i < size ; i++) {
-        already_accessed = already_accessed || seg->accessed[i].load();
-        if(already_accessed && seg->accessed_id[i].load() != tx) {
+
+    unsigned long offset = (char*) source - (char*)seg->start;
+    // cout << offset << endl;
+    // cout << size << endl;
+    unsigned int old_tx = 0;
+    for(size_t i = offset ; i < offset + size ; i++) {
+        if(seg->accessed[i].load()) {
+            if(seg->accessed_id[i].load() != tx) {
+                cout << "READ FAILED : WRITTEN BY OTHER " << endl;
+                end_transaction(region);
+                return false;
+            }
+            else {
+                memcpy(target + (i - offset), source + WRITE_OFFSET + i, 1);
+            }
+        }
+        old_tx = seg->accessed_id[i].exchange(tx);
+        if(old_tx != tx && old_tx != 0) {
+            cout << "READ FAILED : ACCESSED " << endl;
             end_transaction(region);
             return false;
         }
+        memcpy(target + (i - offset), source + i, 1);
     }
+    cout << "SUCCESS READ " << endl;
+    return true;
+    
+    // bool already_accessed = false;
+    // unsigned long offset = (char*)source - (char*)seg->start;
+    // cout << offset << endl;
+    // cout << size << endl;
+    // for(size_t i = offset ; i < offset + size ; i++) {
+    //     already_accessed = already_accessed || seg->accessed[i].load();
+    //     if(already_accessed && seg->accessed_id[i].load() != tx) {
+    //         cout << "READ FAIL : WRITTEN BY OTHER " << endl;
+    //         end_transaction(region);
+    //         return false;
+    //     }
+    // }
 
-    if(already_accessed) {
-        memcpy(target, source, size);
-        cout << "READ SUCCESSFUL AUTOACCESS " << endl;
-        return true;
-    }
-    else {
-        unsigned int no_tx = 0;
-        for(size_t i = offset ; i < size ; i++) {
-            // region->accessed[i].store(true);
-            if(!seg->accessed_id[i].compare_exchange_strong(no_tx, tx)) {
-                if(seg->accessed_id[i].load() != tx) {
-                    end_transaction(region);
-                    return false;
-                }
-                no_tx = 0;
-            }
-        }
+    // if(already_accessed) {
+    //     memcpy(target, source + WRITE_OFFSET, size);
+    //     cout << "READ SUCCESSFUL AUTOACCESS " << endl;
+    //     return true;
+    // }
+    // else {
+    //     unsigned int no_tx = 0;
+    //     for(size_t i = offset ; i < offset + size ; i++) {
+    //         // region->accessed[i].store(true);
+    //         if(!seg->accessed_id[i].compare_exchange_strong(no_tx, tx)) {
+    //             if(seg->accessed_id[i].load() != tx) {
+    //                 cout << "READ FAIL SINCE " << endl;
+    //                 end_transaction(region);
+    //                 return false;
+    //             }
+    //             no_tx = 0;
+    //         }
+    //     }
 
-        cout << "READ SUCCESSFUL CLASSIC " << endl;
-        memcpy(target, source, size);
-        return true;
-    }
+    //     cout << "READ SUCCESSFUL CLASSIC " << endl;
+    //     memcpy(target, source, size);
+    //     return true;
+    // }
 }
 
 /** [thread-safe] Write operation in the given transaction, source in a private region and target in the shared region.
@@ -363,7 +432,7 @@ bool tm_write(shared_t shared, tx_t tx, void const* source, size_t size, void* t
     // cout << "SIZE " << size << endl;
     Region* region = (Region*) shared;
     // unsigned long target_address = *((unsigned long*) target);
-    // cout << "TO ADDR " << target_address << endl;
+    // cout << "TO ADDR " << target << endl;
 
     Segment* seg = check_segments(region->segments, target, size);
     if(seg == nullptr) {// && !check_segments(region->new_segments, target_address, size)) {
@@ -384,22 +453,28 @@ bool tm_write(shared_t shared, tx_t tx, void const* source, size_t size, void* t
     //     }
     // }
 
+
     unsigned long offset = (char*) target - (char*)seg->start;
-    unsigned int no_tx = 0;
-    for(size_t i = offset ; i < size ; i++) { //SHOULD WE FUSE THIS WITH COMPARE AND SWAP LOOP ?
+    // cout << offset << endl;
+    // cout << size << endl;
+    unsigned int old_tx = 0;
+    for(size_t i = offset ; i < offset + size ; i++) { //SHOULD WE FUSE THIS WITH COMPARE AND SWAP LOOP ?
         seg->accessed[i].store(true);
-        if(seg->accessed_id[i].compare_exchange_strong(no_tx, tx)) {
-            if(seg->accessed_id[i].load() != tx) {
-                end_transaction(region);
-                cout << "FAILED WRITE ACCESSED SINCE " << endl;
-                return false;
-            }
-            no_tx = 0;
+        old_tx = seg->accessed_id[i].exchange(tx);
+        if(old_tx != 0 && old_tx != tx) {
+            cout << old_tx << endl;
+            cout << tx << endl;
+            cout << "FAILED WRITE ACCESSED SINCE " << endl;
+            end_transaction(region);
+            return false;
+            // cout << "WRITTEN BY ME, IS OK " << endl;
+            // no_tx = 0;
         }
     }
 
     cout << "SUCCESS WRITE " << endl;
-    memcpy(target, source, size);
+    cout << target + WRITE_OFFSET << endl;
+    memcpy(target + WRITE_OFFSET, source, size);
     return true;
 }
 

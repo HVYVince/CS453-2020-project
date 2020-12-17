@@ -35,7 +35,7 @@
 
 #define REGION_BYTE_SIZE 536870912 // 1GiO
 #define WRITE_OFFSET 536870912
-#define READ_ONLY_OFFSET 4294967296 // 2^32
+#define READ_ONLY_OFFSET 1073741824 // 2^32
 #define READ 0
 #define WRITE 1
 
@@ -46,8 +46,8 @@ using namespace std;
 using shared_t = void*;
 constexpr static shared_t invalid_shared = nullptr; // Invalid shared memory region
 
-using tx_t = uintptr_t;
-constexpr static tx_t invalid_tx = ~(tx_t(0)); // Invalid transaction constant
+using tx_t = unsigned int;
+constexpr static tx_t invalid_tx = 0; // Invalid transaction constant
 
 enum class Alloc: int {
     success = 0, // Allocation successful and the TX can continue
