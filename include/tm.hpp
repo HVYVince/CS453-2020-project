@@ -33,7 +33,7 @@
 #include <cstring>
 #include <iostream>
 
-#define MAX_TRANSACTIONS 1073741824 //1GiO
+#define MAX_TRANSACTIONS 1024//1073741824 //1GiO
 
 using namespace std;
 
