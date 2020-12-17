@@ -48,7 +48,7 @@ using shared_t = void*;
 constexpr static shared_t invalid_shared = nullptr; // Invalid shared memory region
 
 using tx_t = unsigned int;
-constexpr static tx_t invalid_tx = 0; // Invalid transaction constant
+constexpr static tx_t invalid_tx = MAX_TRANSACTIONS + 1; // Invalid transaction constant
 
 enum class Alloc: int {
     success = 0, // Allocation successful and the TX can continue
