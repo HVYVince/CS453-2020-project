@@ -33,12 +33,7 @@
 #include <cstring>
 #include <iostream>
 
-#define REGION_BYTE_SIZE 536870912 // 1GiO
-#define WRITE_OFFSET 536870912
-#define READ_ONLY_OFFSET 1073741824 // 2^32
-#define READ 0
-#define WRITE 1
-#define MAX_TRANSACTIONS 1024
+#define MAX_TRANSACTIONS 1073741824 //1GiO
 
 using namespace std;
 
