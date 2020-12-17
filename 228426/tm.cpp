@@ -62,57 +62,57 @@
     #warning This compiler has no support for GCC attributes
 #endif
 
-// -------------------------------------------------------------------------- //
 struct Segment {
-    size_t size;
-    void* start;
-    atomic_bool deregister;
-    atomic_bool* accessed;
-    atomic_uint* accessed_id;
-
-    Segment(size_t sz, void* st) {
-        start = st;
-        size = sz;
-        deregister.store(false);
-        accessed = new atomic_bool[sz];
-        accessed_id = new atomic_uint[sz];
-        for(size_t i = 0 ; i < sz ; i++) {
-            accessed[i].store(false);
-            accessed_id[i].store(0);
-        }
-    }
+    Segment* prev; // Previous link in the chain
+    Segment* next; // Next link in the chain
+    size_t size_seg;
+    void* memory_source;
+    bool deleted;
 };
 
+static void link_reset(Segment* link) {
+    link->prev = link;
+    link->next = link;
+}
+
+static void link_insert(Segment* link, Segment* base) {
+    Segment* prev = base->prev;
+    link->prev = prev;
+    link->next = base;
+    base->prev = link;
+    prev->next = link;
+}
+
+static void link_remove(Segment* link) {
+    Segment* prev = link->prev;
+    Segment* next = link->next;
+    prev->next = next;
+    next->prev = prev;
+}
+
 struct Region {
-    void* memory[2];
+    size_t init_size;
     size_t alignment;
     size_t align_alloc;
     size_t delta_alloc;
-    vector<Segment*> segments;
-    vector<Segment*> new_segments;
-    // mutex vector_mutex;
-    mutex batcher_mutex;
-    mutex commit_mutex;
-    atomic_uint in_transaction;
+    atomic_uint segment_allocator;
     atomic_uint tx_generator;
-    atomic_uint waiting;
-    atomic_uint expected_out;
-    condition_variable batcher;
-    condition_variable commit_holder;
-    // size_t initial_size;
     void* start_address;
+    Segment* memory;
+    Segment** transact_memories;
+    void** reference_memory; //POINTER ON intptr_t
+    mutex memory_lock;
+    mutex deletion_lock;
+    bool* readonly_transactions;
 
-    Region(size_t align) {
-        // memory[READ] = new char[REGION_BYTE_SIZE];
-        // memory[WRITE] = new char[REGION_BYTE_SIZE];
+    vector<int> *indicators;
+
+    Region(size_t size, size_t align) {
+        init_size = size;
         alignment = align;
-        segments = vector<Segment*>();//(1, nullptr);
-        new_segments = vector<Segment*>();
-        in_transaction.store(0);
+        segment_allocator.store(MAX_TRANSACTIONS + 1);
         tx_generator.store(0);
-        waiting.store(0);
-        expected_out.store(1);
-        // initial_size = size;
+        indicators = new vector<int>();
     }
 };
 
@@ -123,32 +123,46 @@ struct Region {
 **/
 shared_t tm_create(size_t size, size_t align) noexcept {
     cout << "TM CREATE " << endl;
-    Region* region = new Region(align);
-    if(unlikely(!region))
+    Region* region = new Region(size, align);
+    if(unlikely(!region)) {
         return invalid_shared;
+    }
 
-    region->segments.push_back(new Segment(size, 0));
-    size_t align_alloc = align < sizeof(void*) ? sizeof(void*) : align;
+    region->align_alloc = align < sizeof(void*) ? sizeof(void*) : align;
+    region->delta_alloc = (sizeof(Segment) + region->align_alloc - 1) / region->align_alloc * region->align_alloc;
+    //REMOVE DUMB DIVIDE THEN MULT
 
-    if(unlikely(posix_memalign(&(region->memory[READ]), align_alloc, 2 * REGION_BYTE_SIZE) != 0)) {
+    if(unlikely(posix_memalign(&(region->start_address), region->align_alloc, size + region->delta_alloc) != 0)) {
         delete region;
         return invalid_shared;
     }
-    // if(unlikely(posix_memalign(&(region->memory[WRITE]), align_alloc, REGION_BYTE_SIZE) != 0)) {
-    //     delete region->memory[READ];
-    //     delete region;
-    //     return invalid_shared;
-    // }
 
-    region->segments[0]->start = region->memory[READ];
-    region->start_address = region->segments[0]->start;
-    region->align_alloc = align_alloc;
+    region->memory = (Segment*)region->start_address;
+    region->start_address = (char*) region->start_address + region->delta_alloc;
+    memset(region->start_address, 0, size);
+    link_reset(region->memory);
+    region->memory->size_seg = size;
+    region->memory->memory_source = region->start_address;
 
-    if(unlikely(!region->segments[0]))
+    void* datas;
+    cout << "SIZE IS " << (sizeof(Segment*) + sizeof(void*) + sizeof(bool) + region->delta_alloc + size) * MAX_TRANSACTIONS << endl;
+    if(unlikely(posix_memalign(&(datas), region->align_alloc, (sizeof(Segment*) + sizeof(void*) + sizeof(bool) + region->delta_alloc + size) * MAX_TRANSACTIONS) != 0)) {
+        delete region->memory;
+        delete region;
         return invalid_shared;
+    }
 
-    memset(region->memory[READ], 0, size);
-    memset(region->memory[WRITE], 0, size);
+    region->reference_memory = &datas;
+    region->transact_memories = (Segment**)(datas + (sizeof(void*) * MAX_TRANSACTIONS));
+    region->readonly_transactions = (bool*)(datas + (sizeof(void*) + sizeof(Segment*) * MAX_TRANSACTIONS));
+
+    for(size_t i = 0 ; i < MAX_TRANSACTIONS ; i++) {
+        region->transact_memories[i] = (Segment*)((char*)(&region->readonly_transactions[MAX_TRANSACTIONS]) + i * (region->delta_alloc + size));
+        link_reset(region->transact_memories[i]);
+        region->transact_memories[i]->size_seg = region->init_size;
+        region->transact_memories[i]->deleted = false;
+        region->transact_memories[i]->memory_source = region->start_address;
+    }
 
     return region;
 }
@@ -159,14 +173,18 @@ shared_t tm_create(size_t size, size_t align) noexcept {
 void tm_destroy(shared_t shared) noexcept {
     cout << "TM DESTROY " << endl;
     Region* region = (Region*) shared;
-    for(Segment* segment : region->segments) {
-        delete[] segment->accessed;
-        delete[] segment->accessed_id;
-        delete segment;
+    Segment* init = region->transact_memories[0];
+    Segment* iterator = init->next;
+    while(iterator != init) {
+        Segment* next = iterator->next;
+        delete iterator->memory_source;
+        delete iterator;
+        iterator = next;
     }
-    // region->segments.clear();
-    // region->new_segments.clear();
-    // free(region->memory);
+
+    delete region->transact_memories;
+    delete region->indicators;
+    delete region->memory;
     delete region;
 }
 
@@ -177,7 +195,6 @@ void tm_destroy(shared_t shared) noexcept {
 void* tm_start(shared_t shared) noexcept {
     cout << "TM START " << endl;
     Region* region = (Region*) shared;
-    cout << region->start_address << endl;
     return region->start_address;
 }
 
@@ -188,7 +205,7 @@ void* tm_start(shared_t shared) noexcept {
 size_t tm_size(shared_t shared) noexcept {
     cout << "TM SIZE " << endl;
     Region* region = (Region*) shared;
-    return region->segments[0]->size;
+    return region->init_size;
 }
 
 /** [thread-safe] Return the alignment (in bytes) of the memory accesses on the given shared memory region.
@@ -201,6 +218,8 @@ size_t tm_align(shared_t shared) noexcept {
     return region->alignment;
 }
 
+// void remove_segment(Region* region, int counter, Segment*)
+
 /** [thread-safe] Begin a new transaction on the given shared memory region.
  * @param shared Shared memory region to start a transaction on
  * @param is_ro  Whether the transaction is read-only
@@ -209,117 +228,117 @@ size_t tm_align(shared_t shared) noexcept {
 tx_t tm_begin(shared_t shared , bool is_ro) noexcept {
     cout << "TM BEGIN " << endl;
     Region* region = (Region*) shared;
-    tx_t id = ++(region->tx_generator);
-    // cout << "ID UPDATED " << endl;
-    if(is_ro)
-        id += READ_ONLY_OFFSET;
-    // cout << "LOCKING " << endl;
-    unique_lock<mutex> lock(region->batcher_mutex);
-    region->waiting++;
-    // cout << "LOCKED " << endl;
-    if(region->in_transaction.load() != 0)
-        region->batcher.wait(lock);
-    // cout << "PASSED THROUGH " << endl;
-    region->expected_out--;
-    region->waiting--;
-    region->in_transaction++;
-    lock.unlock();
+    unsigned int id = ++region->tx_generator; //NO COMPARE AND SWAP
 
-    cout << "IN TRANSACTION " << endl;
-    cout << id << endl;
-    return id;
-}
+    tx_t transact = id % MAX_TRANSACTIONS;
+    Segment* memory = region->memory;
 
-void end_transaction(Region* region) {
-    cout << "ENDING TRANSACT " << endl;
-    // unique_lock<mutex> lock(region->batcher_mutex);  
-    cout << "OUT " << region->expected_out.load() << endl;
-    while(region->expected_out.load() != 0 && region->expected_out.load() < 100);  
-    int left = --(region->in_transaction);
-    // lock.unlock();
-    cout << "LEFT " << left << endl;
-    if(left == 0) {
-        cout << "END OF BATCH " << endl;
-        for(size_t j = 0 ; j < region->segments.size() ; j++) {
-            Segment* seg = region->segments[j];
+    region->readonly_transactions[transact] = is_ro;
+    region->reference_memory[transact] = memory;
 
-            if(seg->deregister.load()) {
-                cout << "DEREGISTERING " << endl;
-                delete[] seg->accessed;
-                delete[] seg->accessed_id;
-                delete seg;
-                region->segments.erase(region->segments.begin() + j);
-                j--;
-                continue;
+    cout << "COPY ? " << endl;
+    cout << (char*)(region->transact_memories[transact]) << endl;
+    cout << (char*)memory + region->delta_alloc << endl;
+    memcpy((char*)region->transact_memories[transact] + region->delta_alloc, (char*)memory + region->delta_alloc, region->init_size);
+    cout << "COPY. " << endl;
+    Segment* head = memory;
+    Segment* transact_head = region->transact_memories[transact];
+    Segment* transact_iterator = transact_head->next;
+    unsigned int counter = 0;
+    cout << "READY TO LOOP " << endl;
+
+    while(memory != head) {
+        cout << "LOOPING " << endl;
+        Segment* memory_next = memory->next;
+        Segment* transact_next = transact_iterator->next;
+        Segment* seg = transact_iterator;
+        seg->size_seg = memory->size_seg;
+        seg->deleted = memory->deleted;
+        seg->memory_source = memory->memory_source;
+        memcpy((void*) seg + region->delta_alloc, (void*) memory + region->delta_alloc, memory->size_seg);
+        if(memory->deleted) { //PUT IN FUNCTION
+            region->deletion_lock.lock();
+            if(counter < region->indicators->size()) {
+                region->indicators->at(counter) = region->indicators->at(counter + 1);
+                if(region->indicators->at(counter == MAX_TRANSACTIONS)) {
+                    for(int i = 0 ; i < MAX_TRANSACTIONS ; i++) {
+                        Segment* remove = transact_iterator + (i - transact) * (region->delta_alloc + transact_iterator->size_seg);
+                        link_remove(remove);
+                    }
+                    delete transact_iterator->memory_source;
+                    delete (transact_iterator - transact * (region->delta_alloc + transact_iterator->size_seg));
+                    region->indicators->erase(region->indicators->begin() + counter);
+                    counter--;
+                }
             }
-
-            // cout << seg->size << endl;
-
-            for(size_t i = 0 ; i < seg->size ; i++) {
-                void* current = seg->start + i;
-                // cout << current << endl;
-                seg->accessed_id[i].store(0);
-                seg->accessed[i].store(false);
-                memcpy(current, current + WRITE_OFFSET, seg->size);
-                // if(seg->accessed[i].load()) {
-                //     // cout << current + WRITE_OFFSET << endl;
-                //     seg->accessed[i].store(false);
-                //     memcpy(current, current + WRITE_OFFSET, 1);
-                // }
-            }
+            region->deletion_lock.unlock();
         }
-
-        // for(auto new_seg : region->new_segments) {
-        //     for(size_t i = 1 ; i < region->segments.size() ; i++) {
-        //         if(new_seg->start < region->segments[i]->start) {
-        //             auto iterator = region->segments.begin() + i;
-        //             region->segments.insert(iterator, new_seg);
-        //             break;
-        //         }
-        //     }
-        // }
-
-        // region->new_segments.clear();
-        region->expected_out.exchange(region->waiting);
-        cout << "OUT BEFORE " << region->expected_out.load() << endl;
-        region->waiting.store(0);
-        region->commit_holder.notify_all();
-        region->batcher.notify_all();
-        return;
+        memory = memory_next;
+        transact_iterator = transact_next;
+        counter++;
     }
-    cout << "TRANSACT ENDED " << endl;
-    unique_lock<mutex> output_lock(region->commit_mutex);
-    region->commit_holder.wait(output_lock);
-    output_lock.unlock();
+    return transact;
 }
+
+// void end_transaction(Region* region) {
+
+// }
 
 /** [thread-safe] End the given transaction.
  * @param shared Shared memory region associated with the transaction
  * @param tx     Transaction to end
  * @return Whether the whole transaction committed
 **/
-bool tm_end(shared_t shared, tx_t tx as(unused)) noexcept {
+bool tm_end(shared_t shared, tx_t tx) noexcept {
     cout << "TM END " << endl;
     Region* region = (Region*) shared;
-    end_transaction(region);
-    cout << "COMMIT COMMIT COMMIT COMMIT COMMIT COMMIT " << endl;
-    return true;
+    Segment* end_memory = region->transact_memories[tx];
+    if(region->readonly_transactions[tx])
+        return true;
+
+    bool correct_allocator = region->segment_allocator.load() == tx;
+    if(correct_allocator)
+        region->segment_allocator.store(MAX_TRANSACTIONS + 1);
+    else
+        region->memory_lock.lock();
+
+    if(region->memory == region->reference_memory[tx]) {
+        Segment* seg = region->transact_memories[tx];
+        memcpy((void*)seg->memory_source, (void*)seg + region->delta_alloc, seg->size_seg);
+        Segment* head = seg;
+        seg = seg->next;
+        while(head != seg) { //DELETED DO WHILE
+            memcpy((void*)seg->memory_source, (void*)seg + region->delta_alloc, seg->size_seg);
+            seg = seg->next;
+        }
+        region->memory = region->transact_memories[tx];
+        region->memory_lock.unlock();
+        return true;
+    }
+    if(!correct_allocator)
+        region->memory_lock.unlock();
+    return false;
 }
 
-Segment* check_segments(vector<Segment*> &segments, const void* source_address, size_t size) {
-    // cout << segments.size() << endl;
-    for(auto seg : segments) { //concurrent accesses to new segments ?
-        void* end_address = seg->start + seg->size;
-        // cout << source_address + size << endl;
-        if(seg->start <= source_address && source_address < end_address) {
-            if(source_address + size <= end_address)
-                return seg;
-            else
-                return nullptr;
+int check_segments(Segment** transact_memory, const void* check_address) {
+    cout << "CHECK SEG " << endl;
+    Segment* head = *transact_memory;
+    int offset = -1;
+    do {
+        cout << "LOOPING " << endl;
+        void* start_address = head->memory_source;
+        void* end_address = start_address + head->size_seg;
+        if(!head->deleted && start_address <= check_address && check_address < end_address) {
+            cout << "FOUND " << endl;
+            cout << check_address << endl;
+            cout << start_address << endl;
+            offset = (char*)check_address - (char*)start_address;
+            *transact_memory = head;
+            return offset;
         }
-    }
-    cout << "SEG CHECK DEFAULT " << endl;
-    return nullptr;
+        head = head->next;
+    } while(head != *transact_memory);
+    return -1;
 }
         // cout << seg->size << endl;
         // cout << source << endl;
@@ -336,87 +355,15 @@ Segment* check_segments(vector<Segment*> &segments, const void* source_address, 
 bool tm_read(shared_t shared, tx_t tx, void const* source, size_t size, void* target) noexcept {
     cout << "TM READ " << endl;
     Region* region = (Region*) shared;
-    // unsigned long source_address = *((unsigned long*) source);
-    Segment* seg = check_segments(region->segments, source, size);
-    if(seg == nullptr) {// && !check_segments(region->new_segments, source_address, size)) {
-        cout << "SEG CHECK READ FAIL " << endl;
-        end_transaction(region); //SHOULD WE CHECK IN NEW SEGS ?
-        return false;
-    }
-
-    if(tx > READ_ONLY_OFFSET) {
-        cout << "READ SUCCESSFUL READONLY " << endl;
-        // cout << seg->start << endl;
-        // cout << seg->size << endl;
-        // cout << source << endl;
-        // cout << size << endl;
-        cout << source << endl;
-        memcpy(target, source, size);
+    unsigned int offset = region->delta_alloc;
+    Segment* seg = region->transact_memories[tx];
+    int in_seg_offset = check_segments(&seg + offset, source);
+    if(in_seg_offset != -1) {
+        offset += in_seg_offset;
+        memcpy(target, (void*)seg + offset, size);
         return true;
     }
-
-    unsigned long offset = (char*) source - (char*)seg->start;
-    // cout << offset << endl;
-    // cout << size << endl;
-    unsigned int old_tx = 0;
-    for(size_t i = offset ; i < offset + size ; i++) {
-        if(seg->accessed[i].load()) {
-            if(seg->accessed_id[i].load() != tx) {
-                cout << "READ FAILED : WRITTEN BY OTHER " << endl;
-                end_transaction(region);
-                return false;
-            }
-            else {
-                memcpy(target + (i - offset), source + WRITE_OFFSET + i, 1);
-            }
-        }
-        old_tx = seg->accessed_id[i].exchange(tx);
-        if(old_tx != tx && old_tx != 0) {
-            cout << "READ FAILED : ACCESSED " << endl;
-            end_transaction(region);
-            return false;
-        }
-        memcpy(target + (i - offset), source + i, 1);
-    }
-    cout << "SUCCESS READ " << endl;
-    return true;
-    
-    // bool already_accessed = false;
-    // unsigned long offset = (char*)source - (char*)seg->start;
-    // cout << offset << endl;
-    // cout << size << endl;
-    // for(size_t i = offset ; i < offset + size ; i++) {
-    //     already_accessed = already_accessed || seg->accessed[i].load();
-    //     if(already_accessed && seg->accessed_id[i].load() != tx) {
-    //         cout << "READ FAIL : WRITTEN BY OTHER " << endl;
-    //         end_transaction(region);
-    //         return false;
-    //     }
-    // }
-
-    // if(already_accessed) {
-    //     memcpy(target, source + WRITE_OFFSET, size);
-    //     cout << "READ SUCCESSFUL AUTOACCESS " << endl;
-    //     return true;
-    // }
-    // else {
-    //     unsigned int no_tx = 0;
-    //     for(size_t i = offset ; i < offset + size ; i++) {
-    //         // region->accessed[i].store(true);
-    //         if(!seg->accessed_id[i].compare_exchange_strong(no_tx, tx)) {
-    //             if(seg->accessed_id[i].load() != tx) {
-    //                 cout << "READ FAIL SINCE " << endl;
-    //                 end_transaction(region);
-    //                 return false;
-    //             }
-    //             no_tx = 0;
-    //         }
-    //     }
-
-    //     cout << "READ SUCCESSFUL CLASSIC " << endl;
-    //     memcpy(target, source, size);
-    //     return true;
-    // }
+    return false;
 }
 
 /** [thread-safe] Write operation in the given transaction, source in a private region and target in the shared region.
@@ -429,53 +376,16 @@ bool tm_read(shared_t shared, tx_t tx, void const* source, size_t size, void* ta
 **/
 bool tm_write(shared_t shared, tx_t tx, void const* source, size_t size, void* target) noexcept {
     cout << "TM WRITE " << endl;
-    // cout << "SIZE " << size << endl;
     Region* region = (Region*) shared;
-    // unsigned long target_address = *((unsigned long*) target);
-    // cout << "TO ADDR " << target << endl;
-
-    Segment* seg = check_segments(region->segments, target, size);
-    if(seg == nullptr) {// && !check_segments(region->new_segments, target_address, size)) {
-        cout << "FAILED WRITE SEG CHECK " << endl;
-        end_transaction(region); // SHOULD WE CHECK IN NEW SEGS ?
-        return false;
+    unsigned int offset = region->delta_alloc;
+    Segment* seg = region->transact_memories[tx];
+    int in_seg_offset = check_segments(&seg + offset, target);
+    if(in_seg_offset != -1) {
+        offset += in_seg_offset;
+        memcpy((void*)seg + offset, source, size);
+        return true;
     }
-
-    // for(size_t i = target_address ; i < target_address + size ; i++) { //SHOULD WE FUSE THIS WITH COMPARE AND SWAP LOOP ?
-    //     unsigned int read_tx = region->accessed_id[i].load();
-    //     // cout << read_tx << endl;
-    //     // cout << tx << endl;
-        
-    //     if(read_tx != 0 && read_tx != tx) {
-    //         cout << "FAILED WRITE ACCESSED REGION " << endl;
-    //         end_transaction(region);
-    //         return false;
-    //     }
-    // }
-
-
-    unsigned long offset = (char*) target - (char*)seg->start;
-    // cout << offset << endl;
-    // cout << size << endl;
-    unsigned int old_tx = 0;
-    for(size_t i = offset ; i < offset + size ; i++) { //SHOULD WE FUSE THIS WITH COMPARE AND SWAP LOOP ?
-        seg->accessed[i].store(true);
-        old_tx = seg->accessed_id[i].exchange(tx);
-        if(old_tx != 0 && old_tx != tx) {
-            cout << old_tx << endl;
-            cout << tx << endl;
-            cout << "FAILED WRITE ACCESSED SINCE " << endl;
-            end_transaction(region);
-            return false;
-            // cout << "WRITTEN BY ME, IS OK " << endl;
-            // no_tx = 0;
-        }
-    }
-
-    cout << "SUCCESS WRITE " << endl;
-    cout << target + WRITE_OFFSET << endl;
-    memcpy(target + WRITE_OFFSET, source, size);
-    return true;
+    return false;
 }
 
 /** [thread-safe] Memory allocation in the given transaction.
@@ -488,64 +398,36 @@ bool tm_write(shared_t shared, tx_t tx, void const* source, size_t size, void* t
 Alloc tm_alloc(shared_t shared, tx_t tx as(unused), size_t size, void** target) noexcept {
     cout << "TM ALLOC " << endl;
     Region* region = (Region*) shared;
-
-    Segment* last_segment = region->segments.back();
-    void* start_address = last_segment->start + last_segment->size;
-    if(start_address >= region->start_address + WRITE_OFFSET)
-        return Alloc::nomem;
-
-    Segment* new_seg = new Segment(size, start_address);
-    if(unlikely(new_seg == nullptr || new_seg->accessed == nullptr || new_seg->accessed_id == nullptr)) {
+    if(region->segment_allocator.load() != tx)
+        region->memory_lock.lock();
+    if(region->memory != region->transact_memories[tx]) {
+        region->memory_lock.unlock();
         return Alloc::abort;
     }
-    region->segments.push_back(new_seg);
-    memset(new_seg->start, 0, size);
-    memset(new_seg->start + WRITE_OFFSET, 0, size);
-    *target = start_address;
+    region->segment_allocator.store(tx);
 
-    // const lock_guard<mutex> lock(region->vector_mutex);
+    void* new_seg;
+    if(unlikely(posix_memalign(&new_seg, region->align_alloc, (region->delta_alloc + size) * MAX_TRANSACTIONS) != 0)) {
+        region->memory_lock.unlock();
+        return Alloc::nomem;
+    }
+    void* new_source;
+    if(unlikely(posix_memalign(&new_source, region->align_alloc, size) != 0)) {
+        region->memory_lock.unlock();
+        return Alloc::nomem;
+    }
 
-    // void* start_address = region->start_address + region->segments[0]->size;
-    // int seg_before = 1;
-    // bool found = false;
-    // for(size_t i = 1 ; i < region->segments.size() ; i++) {
-
-
-
-
-    //     if(region->segments[i]->start - start_address >= size) {
-    //         found = true;
-    //         for(auto new_seg : region->new_segments) {
-    //             if(new_seg->start == start_address)
-    //                 found = false;
-    //         }
-    //         if(!found)
-    //             continue;
-    //         seg_before = i;
-    //         break;
-    //     }
-    //     else {
-    //         start_address = region->segments[i]->start + region->segments[i]->size;
-    //     }
-    // }
-
-    // if(!found) {
-    //     unsigned long last_elem = region->segments.size() - 1;
-    //     start_address = region->segments[last_elem]->start + region->segments[last_elem]->size;
-    //     if(start_address + size >= REGION_BYTE_SIZE)
-    //         return Alloc::nomem;
-    // }
-
-    // region->new_segments.push_back(new Segment(size, start_address));
-    // *target = &(region->segments[seg_before]->start);
-
-    // for(size_t i = start_address ; i < start_address + size ; i++) {
-    //     region->memory[READ][i] = 0;
-    //     region->memory[WRITE][i] = 0;
-    //     region->accessed[i].store(false);
-    //     region->accessed_id[i].store(0);
-    // }
-
+    for(size_t i = 0 ; i < MAX_TRANSACTIONS ; i++) {
+        Segment* seg = (Segment*)(new_seg + i * (region->delta_alloc + size));
+        seg->memory_source = new_source;
+        seg->deleted = false;
+        seg->size_seg = size;
+        link_insert(seg, region->transact_memories[i]);
+    }
+    region->deletion_lock.lock();
+    region->indicators->push_back(0);
+    region->deletion_lock.unlock();
+    *target = new_source;
     return Alloc::success;
 }
 
@@ -555,26 +437,24 @@ Alloc tm_alloc(shared_t shared, tx_t tx as(unused), size_t size, void** target) 
  * @param target Address of the first byte of the previously allocated segment to deallocate
  * @return Whether the whole transaction can continue
 **/
-bool tm_free(shared_t shared, tx_t tx as(unused), void* target) noexcept {
+bool tm_free(shared_t shared, tx_t tx, void* target) noexcept {
     cout << "TM FREE " << endl;
     Region* region = (Region*) shared;
-
-    for(Segment* seg : region->segments) {
-        if(seg->start == target) {
-            seg->deregister.store(true);
-            return true;
-        }
+    if(region->segment_allocator.load() != tx)
+        region->memory_lock.lock();
+    if(region->memory != region->transact_memories[tx]) {
+        region->memory_lock.unlock();
+        return false;
     }
-
-    // for(size_t i = 0 ; i < region->segments.size() ; i++) {
-    //     unsigned long target_address = *((unsigned long*) target);
-    //     if(region->segments[i]->start == target_address) {
-    //         if(i == 0)
-    //             return false;
-    //         region->segments[i]->deregister.store(true);
-    //         return true;
-    //     }
-    // }// Should also free in new segs ?
-
-    return false;
+    region->segment_allocator.store(tx);
+    Segment* seg = region->transact_memories[0];
+    int offset = check_segments(&seg, target);
+    if(offset == -1) {
+        region->memory_lock.unlock();
+        return false;
+    }
+    for(size_t i = 0 ; i < MAX_TRANSACTIONS ; i++)
+        ((Segment*)(seg + i * (seg->size_seg + region->delta_alloc)))->deleted = true;
+    region->memory_lock.unlock();
+    return true;
 }

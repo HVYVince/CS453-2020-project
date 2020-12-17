@@ -38,6 +38,7 @@
 #define READ_ONLY_OFFSET 1073741824 // 2^32
 #define READ 0
 #define WRITE 1
+#define MAX_TRANSACTIONS 1024
 
 using namespace std;
 

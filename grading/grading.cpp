@@ -255,7 +255,7 @@ int main(int argc, char** argv) {
             return 1;
         }
         // Get/set/compute run parameters
-        auto const nbworkers = 2;
+        auto const nbworkers = 1;
         // auto const nbworkers = []() {
         //     auto res = ::std::thread::hardware_concurrency();
         //     if (unlikely(res == 0))
