@@ -68,6 +68,12 @@ struct Segment {
     size_t size_seg;
     void* memory_source;
     bool deleted;
+
+    void init(void* mem, size_t size) {
+        memory_source = mem;
+        deleted = false;
+        size_seg = size;
+    }
 };
 
 static void link_reset(Segment* link) {
@@ -144,49 +150,47 @@ shared_t tm_create(size_t size, size_t align) noexcept {
     region->memory->size_seg = size;
     region->memory->memory_source = region->start_address;
 
-    void* datas;
-    cout << "SIZE IS " << (sizeof(Segment*) + sizeof(void*) + sizeof(bool) + region->delta_alloc + size) * MAX_TRANSACTIONS << endl;
-    if(unlikely(posix_memalign(&(datas), region->align_alloc, (sizeof(Segment*) + sizeof(void*) + sizeof(bool) + region->delta_alloc + size) * MAX_TRANSACTIONS) != 0)) {
-        delete region->memory;
-        delete region;
-        return invalid_shared;
-    }
-    cout << "DATA START AT " << datas << endl;
-    cout << "DATA END AT " << datas + (sizeof(Segment*) + sizeof(void*) + sizeof(bool) + region->delta_alloc + size) * MAX_TRANSACTIONS << endl;
+    // void* datas;
+    // cout << "SIZE IS " << (sizeof(Segment*) + sizeof(void*) + sizeof(bool) + region->delta_alloc + size) * MAX_TRANSACTIONS << endl;
+    // if(unlikely(posix_memalign(&(datas), region->align_alloc, (sizeof(Segment*) + sizeof(intptr_t) + sizeof(bool) + (region->delta_alloc + size)) * MAX_TRANSACTIONS + 8192) != 0)) {
+    //     delete region->memory;
+    //     delete region;
+    //     return invalid_shared;
+    // }
+    // cout << "DATA START AT " << datas << endl;
+    // cout << "DATA END AT " << datas + (sizeof(Segment*) + sizeof(void*) + sizeof(bool) + region->delta_alloc + size) * MAX_TRANSACTIONS << endl;
 
-    region->reference_memory = &datas;
+    posix_memalign(region->reference_memory, region->align_alloc, sizeof(void*) * MAX_TRANSACTIONS);
     region->transact_memories = (Segment**)((char*)datas + (sizeof(intptr_t) * MAX_TRANSACTIONS));
     region->readonly_transactions = (bool*)((char*)datas + (sizeof(intptr_t) + sizeof(Segment*) * MAX_TRANSACTIONS));
+    cout << (void*) (&region->readonly_transactions[0]) << endl;
+    cout << (void*) (&region->readonly_transactions[MAX_TRANSACTIONS]);
 
     for(size_t i = 0 ; i < MAX_TRANSACTIONS ; i++) {
-        region->transact_memories[i] = (Segment*)((char*)(&region->readonly_transactions[MAX_TRANSACTIONS]) + i * (region->delta_alloc + size));
+        region->transact_memories[i] = (Segment*)((char*)(&region->readonly_transactions[MAX_TRANSACTIONS]) + i * (region->delta_alloc + size) + 8192);
         link_reset(region->transact_memories[i]);
-        if (i == 131) {
-            cout << "OK 131" << endl;
-            cout << region->delta_alloc + size << endl;
-            cout << i * (region->delta_alloc + size) << endl;
-            cout << (void*)(&region->readonly_transactions[MAX_TRANSACTIONS]) << endl;
-            cout << (void*)(&region->readonly_transactions[MAX_TRANSACTIONS]) + i * (region->delta_alloc + size) << endl;
-        }
+        region->transact_memories[i]->init(region->start_address, size);
+        
+        // cout << region->readonly_transactions[i] << endl;
         // region->transact_memories[i]->size_seg = region->init_size;
         // region->transact_memories[i]->deleted = false;
         // region->transact_memories[i]->memory_source = region->start_address;
     }
-    for(size_t i = 0 ; i < MAX_TRANSACTIONS ; i++) {
-        cout << i << endl;
-        cout << (void*)region->transact_memories[i] << endl;
-        cout << (void*)region->transact_memories[0] << endl;
-        if(i > 0)
-            cout << (char*)region->transact_memories[i]-(char*)region->transact_memories[i-1] << endl;
-        cout << endl;
-        region->transact_memories[i]->size_seg = region->init_size;
-        region->transact_memories[i]->deleted = false;
-        region->transact_memories[i]->memory_source = region->start_address;
-    }
+    // for(size_t i = 0 ; i < MAX_TRANSACTIONS ; i++) {
+    //     cout << i << endl;
+    //     cout << (void*)region->transact_memories[i] << endl;
+    //     cout << (void*)region->transact_memories[0] << endl;
+    //     if(i > 0)
+    //         cout << (char*)region->transact_memories[i]-(char*)region->transact_memories[i-1] << endl;
+    //     cout << endl;
+    //     region->transact_memories[i]->size_seg = region->init_size;
+    //     region->transact_memories[i]->deleted = false;
+    //     region->transact_memories[i]->memory_source = region->start_address;
+    // }
     cout << "START TRANSACT MEMS AT " << (void*)region->transact_memories[0] << endl;
     // region->transact_memories[0]->memory_source = region->start_address;
     cout << "SOURCE MEM " <<  region->transact_memories[0]->memory_source << endl;
-    cout << "SOURCE MEM 2 " <<  region->transact_memories[1]->memory_source << endl;
+    cout << "SOURCE MEM 2 " <<  region->transact_memories[22]->memory_source << endl;
     cout << "REGION START AT " <<  region->start_address << endl;
 
 
@@ -258,17 +262,22 @@ tx_t tm_begin(shared_t shared , bool is_ro) noexcept {
     unsigned int id = region->tx_generator++; //NO COMPARE AND SWAP
 
     tx_t tx = id % MAX_TRANSACTIONS;
-    // cout << transact << endl;
+    if(id / MAX_TRANSACTIONS == 0)
+        region->transact_memories[tx]->init(region->start_address, region->init_size);
+    cout << tx << endl;
     Segment* memory = region->memory;
+    cout << region->transact_memories[tx]->deleted << endl;
+
 
     region->readonly_transactions[tx] = is_ro;
     region->reference_memory[tx] = memory;
 
-    // cout << "COPY ? " << endl;
-    // cout << (void*)(region->transact_memories[transact]) << endl;
-    // cout << (void*)memory + region->delta_alloc << endl;
-    memcpy((char*)region->transact_memories[tx] + region->delta_alloc, (char*)memory + region->delta_alloc, region->init_size);
-    // cout << "COPY. " << endl;
+    cout << (void*)(region->transact_memories[tx]) + region->delta_alloc << endl;
+    cout << (void*)memory + region->delta_alloc << endl;
+    cout << region->init_size << endl;
+    cout << "COPY ??" << endl;
+    memcpy((void*)region->transact_memories[tx] + region->delta_alloc, (void*)memory + region->delta_alloc, region->init_size);
+    cout << "COPY. " << endl;
     Segment* head = memory;
     Segment* transact_head = region->transact_memories[tx];
     Segment* transact_iterator = transact_head->next;
@@ -325,23 +334,25 @@ bool tm_end(shared_t shared, tx_t tx) noexcept {
     Segment* end_memory = region->transact_memories[tx];
     if(region->readonly_transactions[tx])
         return true;
-    cout << "TEST OK " << endl;
+    // cout << "TEST OK " << endl;
     bool correct_allocator = region->segment_allocator.load() == tx;
     if(correct_allocator)
         region->segment_allocator.store(MAX_TRANSACTIONS + 1);
     else
         region->memory_lock.lock();
 
-    cout << "LOCKED " << endl;
+    // cout << "LOCKED " << endl;
     if(region->memory == region->reference_memory[tx]) {
         Segment* seg = region->transact_memories[tx];
         Segment* head = seg;
         do {
-            cout << seg->memory_source << endl;
+            // cout << seg->memory_source << endl;
             memcpy(seg->memory_source, ((char *) seg) + region->delta_alloc, seg->size_seg);
+            // cout << "COPIED" << endl;
             seg = seg->next;
         } while(seg != head);
         region->memory = region->transact_memories[tx];
+        cout << (void*)region->memory << endl;
         region->memory_lock.unlock();
         return true;
     }
