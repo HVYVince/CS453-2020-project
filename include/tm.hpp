@@ -33,7 +33,8 @@
 #include <cstring>
 #include <iostream>
 
-#define REGION_BYTE_SIZE 1073741824 // 1GiO
+#define REGION_BYTE_SIZE 536870912 // 1GiO
+#define WRITE_OFFSET 536870912
 #define READ_ONLY_OFFSET 4294967296 // 2^32
 #define READ 0
 #define WRITE 1

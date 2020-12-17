@@ -302,7 +302,8 @@ int main(int argc, char** argv) {
             WorkloadBank bank{tl, nbworkers, nbtxperwrk, nbaccounts, expnbaccounts, init_balance, prob_long, prob_alloc};
             try {
                 // Actual performance measurements and correctness check
-                auto res = measure(bank, nbworkers, nbrepeats, seed, maxtick_init, maxtick_perf, maxtick_chck);
+                // auto res = measure(bank, nbworkers, nbrepeats, seed, maxtick_init, maxtick_perf, maxtick_chck);
+                auto res = measure(bank, nbworkers, nbrepeats, seed, Chrono::invalid_tick, Chrono::invalid_tick, Chrono::invalid_tick);
                 // Check false negative-free correctness
                 auto error = ::std::get<0>(res);
                 if (unlikely(error)) {
