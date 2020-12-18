@@ -13,16 +13,26 @@
  * Only the interface (i.e. exported symbols and semantic) must be preserved.
 **/
 
+
+#include <cstddef>
+#include <cstdint>
+#include <vector>
+#include <atomic>
+#include <mutex>
+#include <condition_variable>
+#include <cstring>
+#include <iostream>
+#include "tm.hpp"
+
+using namespace std;
+
+#define MAX_TRANSACTIONS 1024//1073741824 //1GiO
+
 // Requested features
 #define _POSIX_C_SOURCE   200809L
 #ifdef __STDC_NO_ATOMICS__
     #error Current C11 compiler does not support atomic operations
 #endif
-
-// External headers
-
-// Internal headers
-#include <tm.hpp>
 
 // -------------------------------------------------------------------------- //
 
@@ -62,6 +72,8 @@
     #warning This compiler has no support for GCC attributes
 #endif
 
+typedef atomic<unsigned int> atomic_uint;
+
 struct Segment {
     Segment* prev; // Previous link in the chain
     Segment* next; // Next link in the chain
@@ -74,9 +86,8 @@ struct Segment {
         deleted = false;
         size_seg = size;
         memory_source = source;
-        posix_memalign(&private_memory, align, size);
-        if(unlikely(private_memory == nullptr))
-            exit(0);
+        if(unlikely(posix_memalign(&private_memory, align, size) != 0))
+            return;
         memset(private_memory, 0, size);
     }
 };
@@ -93,13 +104,6 @@ static void link_insert(Segment* link, Segment* base) {
     base->prev = link;
     prev->next = link;
 }
-
-// static void link_remove(Segment* link) {
-//     Segment* prev = link->prev;
-//     Segment* next = link->next;
-//     prev->next = next;
-//     next->prev = prev;
-// }
 
 struct Region {
     size_t init_size;
@@ -169,8 +173,6 @@ shared_t tm_create(size_t size, size_t align) noexcept {
 **/
 void tm_destroy(shared_t shared) noexcept {
     Region* region = (Region*) shared;
-    // Segment* init = region->transact_memories[0];
-    // Segment* iterator = init->next;
     delete region->master_memory;
     delete region;
 }
@@ -202,15 +204,12 @@ size_t tm_align(shared_t shared) noexcept {
     return region->alignment;
 }
 
-// void remove_segment(Region* region, int counter, Segment*)
-
 /** [thread-safe] Begin a new transaction on the given shared memory region.
  * @param shared Shared memory region to start a transaction on
  * @param is_ro  Whether the transaction is read-only
  * @return Opaque transaction ID, 'invalid_tx' on failure
 **/
 tx_t tm_begin(shared_t shared , bool is_ro) noexcept {
-
     Region* region = (Region*) shared;
     unsigned int id = region->tx_generator++;
 
@@ -219,22 +218,23 @@ tx_t tm_begin(shared_t shared , bool is_ro) noexcept {
 
     region->readonly_transactions[tx] = is_ro;
     region->reference_memory[tx] = memory;
+    region->transact_memories[tx]->deleted = false;
 
     memcpy(region->transact_memories[tx]->private_memory, region->transact_memories[tx]->memory_source, region->init_size);
     Segment* head = region->transact_memories[tx];
     Segment* iter = head->next;
-    unsigned int counter = 1;
+    Segment* reference_iter = memory->next;
 
     while(head != iter) {
-        memcpy(iter->private_memory, iter->memory_source, iter->size_seg);
+        iter->deleted = reference_iter->deleted;
+        iter->size_seg = reference_iter->size_seg;
+        iter->memory_source = reference_iter->memory_source;
+        memcpy(iter->private_memory, reference_iter->memory_source, reference_iter->size_seg);
+        reference_iter = reference_iter->next;
         iter = iter->next;
     }
     return tx;
 }
-
-// void end_transaction(Region* region) {
-
-// }
 
 /** [thread-safe] End the given transaction.
  * @param shared Shared memory region associated with the transaction
@@ -244,7 +244,10 @@ tx_t tm_begin(shared_t shared , bool is_ro) noexcept {
 bool tm_end(shared_t shared, tx_t tx) noexcept {
     Region* region = (Region*) shared;
     if(region->readonly_transactions[tx]) {
-        return true;
+        region->memory_lock.lock();
+        bool validity = region->memory == region->reference_memory[tx];
+        region->memory_lock.unlock();
+        return validity;
     }
     bool correct_allocator = region->segment_allocator.load() == tx;
     if(correct_allocator)
@@ -259,12 +262,14 @@ bool tm_end(shared_t shared, tx_t tx) noexcept {
             memcpy(seg->memory_source, seg->private_memory, seg->size_seg);
             seg = seg->next;
         } while(seg != head);
+        if(correct_allocator)
+            for(size_t i = 0 ; i < MAX_TRANSACTIONS ; i++)
+                region->transact_memories[i]->prev->deleted = false;
         region->memory = region->transact_memories[tx];
         region->memory_lock.unlock();
         return true;
     }
-    if(!correct_allocator)
-        region->memory_lock.unlock();
+    region->memory_lock.unlock();
     return false;
 }
 
@@ -278,7 +283,7 @@ int check_segments(Segment** seg, const void* check_address) {
             offset = (char*)check_address - (char*)start_address;
             *seg = head;
             return offset;
-        }
+        } 
         head = head->next;
     } while(head != *seg);
     return -1;
@@ -297,7 +302,7 @@ bool tm_read(shared_t shared, tx_t tx, void const* source, size_t size, void* ta
     Segment* seg = region->transact_memories[tx];
     int offset = check_segments(&seg, source);
     if(offset != -1) {
-        memcpy(target, seg->private_memory + offset, size);
+        memcpy(target, (char*)seg->private_memory + offset, size);
         return true;
     }
     return false;
@@ -312,18 +317,11 @@ bool tm_read(shared_t shared, tx_t tx, void const* source, size_t size, void* ta
  * @return Whether the whole transaction can continue
 **/
 bool tm_write(shared_t shared, tx_t tx, void const* source, size_t size, void* target) noexcept {
-    // cout << "TM WRITE " << endl;
     Region* region = (Region*) shared;
-    // unsigned int offset = region->delta_alloc;
-    // cout << "tx " << tx << endl;
     Segment* seg = region->transact_memories[tx];
-    // cout << "SEG " << (void*) seg << endl;
-    // cout << "SEG " << (void*) seg->next << endl;
     int offset = check_segments(&seg, target);
     if(offset != -1) {
-        // cout << "COPY" << endl;
-        memcpy(seg->private_memory + offset, source, size);
-        // cout << "COPIED" << endl;
+        memcpy((char*)seg->private_memory + offset, source, size);
         return true;
     }
     return false;
@@ -336,8 +334,7 @@ bool tm_write(shared_t shared, tx_t tx, void const* source, size_t size, void* t
  * @param target Pointer in private memory receiving the address of the first byte of the newly allocated, aligned segment
  * @return Whether the whole transaction can continue (success/nomem), or not (abort_alloc)
 **/
-Alloc tm_alloc(shared_t shared, tx_t tx as(unused), size_t size, void** target) noexcept {
-    // cout << "TM ALLOC " << endl;
+Alloc tm_alloc(shared_t shared, tx_t tx, size_t size, void** target) noexcept {
     Region* region = (Region*) shared;
     if(region->segment_allocator.load() != tx)
         region->memory_lock.lock();
@@ -347,27 +344,27 @@ Alloc tm_alloc(shared_t shared, tx_t tx as(unused), size_t size, void** target) 
     }
     region->segment_allocator.store(tx);
 
-    // void* new_seg;
-    // if(unlikely(posix_memalign(&new_seg, region->align_alloc, (region->delta_alloc + size) * MAX_TRANSACTIONS) != 0)) {
-    //     region->memory_lock.unlock();
-    //     return Alloc::nomem;
-    // }
-    // void* new_source;
-    // if(unlikely(posix_memalign(&new_source, region->align_alloc, size) != 0)) {
-    //     region->memory_lock.unlock();
-    //     return Alloc::nomem;
-    // }
-
     Segment* new_seg = new Segment(nullptr, size, region->align_alloc);
+    if(unlikely(new_seg->private_memory == nullptr)) {
+        region->segment_allocator.store(MAX_TRANSACTIONS + 1);
+        region->memory_lock.unlock();
+        return Alloc::nomem;
+    }
     new_seg->memory_source = new_seg->private_memory;
 
     for(size_t i = 0 ; i < MAX_TRANSACTIONS ; i++) {
         Segment* seg = new Segment(new_seg->private_memory, size, region->align_alloc);
+        if(unlikely(seg->private_memory == nullptr)) {
+            region->segment_allocator.store(MAX_TRANSACTIONS + 1);
+            region->memory_lock.unlock();
+            return Alloc::nomem;
+        }
         seg->memory_source = new_seg->private_memory;
-        seg->deleted = false;
+        seg->deleted = (i != tx);
         seg->size_seg = size;
         link_insert(seg, region->transact_memories[i]);
     }
+    new_seg->deleted = false;
     region->deletion_lock.lock();
     region->master_memory->push_back(new_seg);
     region->deletion_lock.unlock();
@@ -382,7 +379,6 @@ Alloc tm_alloc(shared_t shared, tx_t tx as(unused), size_t size, void** target) 
  * @return Whether the whole transaction can continue
 **/
 bool tm_free(shared_t shared, tx_t tx, void* target) noexcept {
-    // cout << "TM FREE " << endl;
     Region* region = (Region*) shared;
     if(target == region->start_address)
         return false;
@@ -392,7 +388,6 @@ bool tm_free(shared_t shared, tx_t tx, void* target) noexcept {
         region->memory_lock.unlock();
         return false;
     }
-    // cout << "LOCKED" << endl;
     region->segment_allocator.store(tx);
     int master_index = -1;
     for(size_t i = 0 ; i < region->master_memory->size() ; i++) {
@@ -400,13 +395,10 @@ bool tm_free(shared_t shared, tx_t tx, void* target) noexcept {
         if(seg->memory_source == target) {
             seg->deleted = true;
             master_index = i;
-            // cout << "FREE FOUND SEG" << endl;
-            // cout << "FREE AT " << i << endl;
             break;
         }
     }
     if(master_index == -1) {
-        // cout << "FREE NOT FOUND" << endl;
         region->memory_lock.unlock();
         return false;
     }
@@ -419,9 +411,6 @@ bool tm_free(shared_t shared, tx_t tx, void* target) noexcept {
             counter--;
         }
         seg->deleted = true;
-        // cout << "FREE DELETED " << endl;
     }
-    // cout << "FREE UNLOCK" << endl;
-    region->memory_lock.unlock();
     return true;
 }
